@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lockon – auto multi-object tracker</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#eceae4;--ink:#1b1f24;--card:#fff;--line:#c9c5bb;--sig:#0a6cff;--muted:#5c6168}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15181c;--ink:#eceae4;--card:#1f242a;--line:#343b44;--sig:#4da3ff;--muted:#9aa1aa}}
+:root[data-theme="dark"]{--bg:#15181c;--ink:#eceae4;--card:#1f242a;--line:#343b44;--sig:#4da3ff;--muted:#9aa1aa}
+*,*:before,*:after{box-sizing:inherit}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Trebuchet MS","Segoe UI",system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font:700 1.7rem/1.1 "Trebuchet MS",system-ui,sans-serif;letter-spacing:-.02em;margin:4px 0}
+p.sub{margin:0 0 14px;color:var(--muted)}
+#stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:10px;overflow:hidden;border:2px solid var(--line)}
+#stage.on{border-color:var(--sig)}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+#hint{position:absolute;inset:auto 0 12px 0;text-align:center;color:#fff;font-size:.95rem;text-shadow:0 1px 4px #000;pointer-events:none;padding:0 12px}
+#msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;text-align:center;color:#fff;padding:24px;background:#000c}
+.row{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}
+button{font:inherit;font-weight:600;padding:10px 16px;border-radius:8px;border:2px solid var(--ink);background:var(--card);color:var(--ink);cursor:pointer;min-height:44px}
+button.primary{background:var(--sig);border-color:var(--sig);color:#fff}
+button:focus-visible,input:focus-visible{outline:3px solid var(--sig);outline-offset:2px}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+.panel span{display:block;color:var(--muted);font-size:.85rem}
+.panel b{font-variant-numeric:tabular-nums}
+label{display:flex;align-items:center;gap:10px;margin-top:12px;color:var(--muted)}
+input[type=range]{flex:1;accent-color:var(--sig)}
+</style>
+</head>
+<body>
+<main>
+<h1>Lockon</h1>
+<p class="sub">Point the camera and hold it steady. Anything that moves is found and followed automatically, as many objects at once as are in view.</p>
+<div id="stage">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+  <div id="hint">Start the camera</div>
+  <div id="msg"></div>
+</div>
+<div class="row">
+  <button class="primary" id="start">Start camera</button>
+  <button id="flip">Switch camera</button>
+  <button id="reset">Relearn background</button>
+</div>
+<div class="panel">
+  <div><span>Tracking now</span><b id="n">0 objects</b></div>
+  <div><span>Total seen</span><b id="tot">0</b></div>
+</div>
+<label>Sensitivity <input type="range" id="sens" min="10" max="70" value="32"></label>
+<label>Smallest object <input type="range" id="minA" min="6" max="120" value="18"></label>
+</main>
+<script>
+(function(){
+var v=document.getElementById('v'),c=document.getElementById('c'),ctx=c.getContext('2d'),stage=document.getElementById('stage');
+var hint=document.getElementById('hint'),msg=document.getElementById('msg');
+var nEl=document.getElementById('n'),totEl=document.getElementById('tot');
+var sensEl=document.getElementById('sens'),minEl=document.getElementById('minA');
+var W=160,H=120,small=document.createElement('canvas'),sctx=small.getContext('2d',{willReadFrequently:true});
+var stream=null,facing='environment',gray,bg,mask,tmp,lab,stack,warm=0,running=false;
+var tracks=[],nextId=1;
+
+function showMsg(t){msg.textContent=t;msg.style.display=t?'flex':'none'}
+
+async function start(){
+  showMsg('');
+  try{
+    if(stream)stream.getTracks().forEach(function(t){t.stop()});
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:960},height:{ideal:720}},audio:false});
+    v.srcObject=stream;await v.play();
+    v.onloadedmetadata=setup;setup();
+    if(!running){running=true;requestAnimationFrame(loop)}
+  }catch(e){
+    showMsg(e.name==='NotAllowedError'?'Camera permission is off. Turn it on in Settings > Apps > Lockon > Permissions, then tap Start camera.':'Camera unavailable. Allow camera access, or open this page directly in its own tab. ('+(e.name||'error')+')');
+  }
+}
+
+function setup(){
+  var vw=v.videoWidth||640,vh=v.videoHeight||480;
+  stage.style.aspectRatio=vw+'/'+vh;
+  H=Math.round(W*vh/vw);small.width=W;small.height=H;c.width=vw;c.height=vh;
+  var N=W*H;gray=new Uint8Array(N);bg=new Float32Array(N);mask=new Uint8Array(N);tmp=new Uint8Array(N);
+  lab=new Uint8Array(N);stack=new Int32Array(N);
+  relearn();
+}
+function relearn(){warm=0;tracks=[];stage.className='';hint.textContent='Learning the scene… hold still';}
+
+function grab(){
+  sctx.drawImage(v,0,0,W,H);
+  var d=sctx.getImageData(0,0,W,H).data;
+  for(var i=0,j=0;i<d.length;i+=4,j++)gray[j]=(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;
+}
+
+function detect(){
+  var th=parseInt(sensEl.value,10),N=W*H,i,x,y;
+  for(i=0;i<N;i++){var d=gray[i]-bg[i];tmp[i]=(d>th||d<-th)?1:0}
+  // dilate horizontally then vertically (radius 2) to merge fragments
+  for(y=0;y<H;y++)for(x=0;x<W;x++){var o=y*W+x,m=0;
+    for(var k=-2;k<=2;k++){var xx=x+k;if(xx>=0&&xx<W&&tmp[y*W+xx]){m=1;break}}mask[o]=m}
+  for(y=0;y<H;y++)for(x=0;x<W;x++){var o2=y*W+x,m2=0;
+    for(var k2=-2;k2<=2;k2++){var yy=y+k2;if(yy>=0&&yy<H&&mask[yy*W+x]){m2=1;break}}lab[o2]=m2?1:0}
+  var minA=parseInt(minEl.value,10),out=[];
+  for(i=0;i<N;i++){
+    if(lab[i]!==1)continue;
+    var sp=0,area=0,x0=W,y0=H,x1=0,y1=0;stack[sp++]=i;lab[i]=2;
+    while(sp){
+      var p=stack[--sp],px=p%W,py=(p/W)|0;area++;
+      if(px<x0)x0=px;if(px>x1)x1=px;if(py<y0)y0=py;if(py>y1)y1=py;
+      if(px>0&&lab[p-1]===1){lab[p-1]=2;stack[sp++]=p-1}
+      if(px<W-1&&lab[p+1]===1){lab[p+1]=2;stack[sp++]=p+1}
+      if(py>0&&lab[p-W]===1){lab[p-W]=2;stack[sp++]=p-W}
+      if(py<H-1&&lab[p+W]===1){lab[p+W]=2;stack[sp++]=p+W}
+    }
+    if(area>=minA&&area<N*0.6)out.push({x:(x0+x1)/2,y:(y0+y1)/2,w:x1-x0+1,h:y1-y0+1});
+  }
+  return out;
+}
+
+function update(dets){
+  var used=new Array(dets.length),t,j;
+  tracks.forEach(function(t){t.hit=false});
+  // greedy nearest match using predicted position
+  var pairs=[];
+  tracks.forEach(function(t,ti){dets.forEach(function(d,di){
+    var dx=d.x-(t.x+t.vx),dy=d.y-(t.y+t.vy),dist=Math.hypot(dx,dy),lim=Math.max(t.w,t.h,d.w,d.h)*0.8+10;
+    if(dist<lim)pairs.push([dist,ti,di]);
+  })});
+  pairs.sort(function(a,b){return a[0]-b[0]});
+  pairs.forEach(function(p){
+    var t=tracks[p[1]];if(t.hit||used[p[2]])return;
+    var d=dets[p[2]];t.hit=used[p[2]]=true;
+    t.vx=t.vx*.6+(d.x-t.x)*.4;t.vy=t.vy*.6+(d.y-t.y)*.4;
+    t.x+=(d.x-t.x)*.6;t.y+=(d.y-t.y)*.6;t.w+=(d.w-t.w)*.4;t.h+=(d.h-t.h)*.4;
+    t.miss=0;t.hits++;
+    if(!t.id&&t.hits>=3){t.id=nextId++}
+  });
+  dets.forEach(function(d,di){if(!used[di])tracks.push({id:0,x:d.x,y:d.y,w:d.w,h:d.h,vx:0,vy:0,hits:1,miss:0,hit:true,trail:[]})});
+  tracks.forEach(function(t){
+    if(!t.hit){t.miss++;t.x+=t.vx*.5;t.y+=t.vy*.5}
+    if(t.id){t.trail.push([t.x,t.y]);if(t.trail.length>30)t.trail.shift()}
+  });
+  tracks=tracks.filter(function(t){return t.id?t.miss<25:t.miss<3});
+}
+
+function loop(){
+  requestAnimationFrame(loop);
+  if(!stream||v.readyState<2||!gray)return;
+  grab();
+  var N=W*H,i;
+  if(warm<12){
+    for(i=0;i<N;i++)bg[i]=warm?bg[i]*.7+gray[i]*.3:gray[i];
+    warm++;
+    if(warm===12){hint.textContent='Move something in view';stage.className='on'}
+    return;
+  }
+  var dets=detect();update(dets);
+  var live=tracks.filter(function(t){return t.id&&t.miss<4});
+  // background adapts slowly, faster away from tracked boxes
+  for(i=0;i<N;i++)bg[i]+=(gray[i]-bg[i])*0.02;
+  nEl.textContent=live.length+(live.length===1?' object':' objects');
+  totEl.textContent=nextId-1;
+  if(live.length)hint.textContent='';else hint.textContent='Move something in view';
+  var sx=c.width/W,sy=c.height/H,lw=Math.max(2,c.width/220);
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.font='600 '+Math.round(c.width/32)+'px "Trebuchet MS",system-ui,sans-serif';ctx.textBaseline='top';
+  tracks.forEach(function(t){
+    if(!t.id)return;
+    var col='hsl('+((t.id*67)%360)+',90%,60%)',faded=t.miss>=4;
+    ctx.globalAlpha=faded?.35:1;ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=lw;
+    ctx.beginPath();t.trail.forEach(function(p,k){ctx[k?'lineTo':'moveTo'](p[0]*sx,p[1]*sy)});ctx.stroke();
+    var bw=(t.w+4)*sx,bh=(t.h+4)*sy,x=t.x*sx-bw/2,y=t.y*sy-bh/2;
+    ctx.lineWidth=lw*1.5;ctx.strokeRect(x,y,bw,bh);
+    var label='#'+t.id,tw=ctx.measureText(label).width+10,th=c.width/26;
+    ctx.fillRect(x,Math.max(0,y-th),tw,th);ctx.fillStyle='#000';ctx.fillText(label,x+5,Math.max(0,y-th)+2);
+  });
+  ctx.globalAlpha=1;
+}
+
+document.getElementById('start').onclick=start;
+document.getElementById('flip').onclick=function(){facing=facing==='environment'?'user':'environment';start()};
+document.getElementById('reset').onclick=function(){if(gray)relearn()};
+})();
+</script>
+</body>
+</html>
